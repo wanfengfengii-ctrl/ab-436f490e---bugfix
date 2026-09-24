@@ -1,0 +1,44 @@
+services:
+  # 常驻静态站点
+  web:
+    build:
+      context: .
+      target: runtime
+    image: phase-unwrap-web:latest
+    container_name: phase-unwrap-web
+    ports:
+      # 宿主机端口可通过环境变量 HOST_PORT 配置（.env 或 shell 导出），默认 8080
+      - "${HOST_PORT:-8080}:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
+  # 一次性校验服务：代码测试 → 构建检查 → HTTP 冒烟，全部通过后以退出码 0 自行退出
+  verify:
+    build:
+      context: .
+      target: builder
+    image: phase-unwrap-verify:latest
+    container_name: phase-unwrap-verify
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        echo "==> [1/3] 代码测试（vitest，含求解器暴力交叉验证与界面测试）"
+        npm test
+        echo "==> [2/3] 构建检查（tsc 类型检查 + vite 生产构建）"
+        npm run build
+        echo "==> [3/3] HTTP 冒烟（经 compose 内网访问 web:80）"
+        wget -q -O- http://web/healthz | grep -qx ok
+        wget -q -O- http://web/ | grep -q "干涉相位展开台"
+        echo ""
+        echo "VERIFY OK: 测试、构建与 HTTP 冒烟全部通过"
