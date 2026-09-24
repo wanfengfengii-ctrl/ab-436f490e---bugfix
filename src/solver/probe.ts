@@ -8,18 +8,15 @@
  *     （即补测集击中每个替代矩阵的差异单元集合）；
  *   - 依次选择测点数最少、行优先坐标序列字典序最小的计划。
  *
- * 若允许的测点数上限内仍不能区分全部替代矩阵，则给出在同样偏好下
- * （测点最少、字典序最小）覆盖替代矩阵数最多的计划，以及首个未被
- * 区分的圈数矩阵与其差异单元。
+ * 若允许的测点数上限内仍不能区分全部替代矩阵，则凑满允许的测点，
+ * 给出覆盖替代矩阵数最多的计划；覆盖数并列时取行优先坐标序列字典序
+ * 最小者，并给出首个未被区分的圈数矩阵与其差异单元。
  */
 
 export const MIN_PROBES = 2;
 export const MAX_PROBES = 10;
 /** 替代矩阵枚举撞上预算时，规划不再可靠（见 solver 中同名预算） */
 export const DEFAULT_ALTERNATIVE_BUDGET = 200;
-/** 最佳努力搜索的节点预算，超过后取当时最优（确定性行为） */
-const SEARCH_NODE_BUDGET = 500_000;
-
 export interface ProbeWitness {
   /** 替代见证的完整行优先圈数序列 */
   cycles: number[];
@@ -111,26 +108,12 @@ export function buildProbePlan(
   }
   const hitsOf = (i: number): bigint => cellHits.get(i) ?? 0n;
 
-  /** 出现过差异的单元（只有这些点能提供区分度），升序 */
-  const varying: number[] = [];
-  {
-    const seen = new Set<number>();
-    for (const a of alts) for (const i of a.diff) if (!seen.has(i)) seen.add(i);
-    varying.push(...seen);
-    varying.sort((x, y) => x - y);
-  }
-
   /** 可触达单元（除锚点外的全部格），升序 */
   const reachable: number[] = [];
   for (let i = 0; i < N; i++) if (i !== anchorIndex) reachable.push(i);
 
   /** 未被选中点击中的替代矩阵位掩码（替代矩阵数 ≤ 枚举预算，用 bigint 稳妥） */
   const fullMask = (1n << BigInt(alts.length)) - 1n;
-  const uncoveredOf = (chosen: Set<number>): bigint => {
-    let m = fullMask;
-    for (const i of chosen) m &= ~hitsOf(i);
-    return m;
-  };
   const firstUncovered = (mask: bigint): number => {
     if (mask === 0n) return -1;
     for (let j = 0; j < alts.length; j++) if (mask & (1n << BigInt(j))) return j;
@@ -262,88 +245,182 @@ export function buildProbePlan(
     }
   }
 
-  /* ---- 上限内无法全部分辨：求覆盖替代矩阵数最多的努力计划 ---- */
+  /* ---- 上限内无法全部分辨：精确求覆盖替代矩阵数最多的努力计划 ---- */
 
-  // 目标测点数：尽量凑满 MAX_PROBES（差异点不足时用最小可触达格填充）
-  const coreK = Math.min(MAX_PROBES, varying.length);
-  let bestSelected: number[] = varying.slice(0, coreK);
-  let bestCovered = -1;
-  let nodes = 0;
-
-  const coverageOf = (sel: Set<number>): number => {
+  const planK = upperK;
+  const reachCount = reachable.length;
+  const popCounts = new Map<bigint, number>();
+  const popCount = (mask: bigint): number => {
+    const cached = popCounts.get(mask);
+    if (cached !== undefined) return cached;
     let n = 0;
-    for (const a of alts) if (a.diff.some((i) => sel.has(i))) n++;
+    for (let x = mask; x !== 0n; x &= x - 1n) n++;
+    popCounts.set(mask, n);
     return n;
   };
 
-  const chosen: number[] = [];
-  const inChosen = new Set<number>();
-  const maximize = (start: number): void => {
-    const covered = coverageOf(inChosen);
-    const remaining = coreK - chosen.length;
-    const uncoveredCount = alts.length - covered;
-    // 乐观上界：剩余名额每点最多新覆盖一个“当前未覆盖”的替代矩阵组
-    if (covered + Math.min(remaining, uncoveredCount) < bestCovered) return;
-    if (chosen.length === coreK) {
-      // 仅在满深度（coreK 个差异点）叶子上比较，避免短序列误入
-      if (
-        covered > bestCovered ||
-        (covered === bestCovered && lexSeq(chosen, bestSelected) < 0)
-      ) {
-        bestCovered = covered;
-        bestSelected = chosen.slice();
+  /**
+   * 精确判定：从 reachable[pos] 起、至多再选 slotsLeft 个单元时，
+   * 已选集合（其命中的补集为 uncovered）最终能否覆盖至少 need 个替代矩阵。
+   *
+   * 用“覆盖函数单调子模”的贪心序列上界剪枝：取贪心底线 F_t（前 t 步的
+   * 边际新增之和）与下一步边际 δ_{t+1}，任何至多 k 个点的集合至多再覆盖
+   * F_t + k·δ_{t+1}（取各 t 的最小值）。该上界是对最优值的有效上界，
+   * 因此剪枝不会漏掉真正的最大覆盖方案（已对暴力枚举交叉验证）。
+   */
+  const makeCanReachTarget = (need: number) => {
+    const cache = new Map<string, boolean>();
+
+    /**
+     * 同一贪心序列同时给出：
+     *   - upper：覆盖函数单调子模的有效上界 min_t(F_t + k·δ_{t+1})；
+     *   - greedyCovered：贪心底线实际覆盖数（下界）。
+     */
+    const greedyBounds = (
+      uncovered: bigint,
+      slots: number,
+      pos: number,
+    ): { upper: number; greedyCovered: number } => {
+      const marginals: number[] = [];
+      let rest = uncovered;
+      for (let t = 0; t <= slots && rest !== 0n; t++) {
+        let bestGain = 0n;
+        for (let q = pos; q < reachCount; q++) {
+          const gain = hitsOf(reachable[q]) & rest;
+          if (popCount(gain) > popCount(bestGain)) bestGain = gain;
+        }
+        if (bestGain === 0n) break;
+        marginals.push(popCount(bestGain));
+        rest &= ~bestGain;
       }
-      return;
-    }
-    if (++nodes > SEARCH_NODE_BUDGET) return; // 预算耗尽：停止扩展，保留已找到的满深度最优
-    // 候选：击中任一未覆盖集合且下标 ≥ start 的全部单元（升序），
-    // 保证按字典序完整搜索，而非只沿首个未覆盖集的差异点贪心。
-    let candBits = 0n;
-    for (let t = 0; t < alts.length; t++) {
-      if (uncoveredOf(inChosen) & (1n << BigInt(t))) {
-        for (const i of alts[t].diff) if (i >= start) candBits |= 1n << BigInt(i);
+      let prefix = 0;
+      let upper = Number.POSITIVE_INFINITY;
+      let greedyCovered = 0;
+      for (let t = 0; t <= marginals.length; t++) {
+        const next = t < marginals.length ? marginals[t] : 0;
+        upper = Math.min(upper, prefix + slots * next);
+        if (t < slots && t < marginals.length) greedyCovered += marginals[t];
+        if (t < marginals.length) prefix += marginals[t];
       }
-    }
-    for (let idx = start; idx < N; idx++) {
-      if (!(candBits & (1n << BigInt(idx)))) continue;
-      chosen.push(idx);
-      inChosen.add(idx);
-      maximize(idx + 1);
-      inChosen.delete(idx);
-      chosen.pop();
-      if (nodes > SEARCH_NODE_BUDGET) break;
-    }
+      return { upper, greedyCovered };
+    };
+
+    const canReach = (
+      uncovered: bigint,
+      slots: number,
+      pos: number,
+    ): boolean => {
+      const covered = alts.length - popCount(uncovered);
+      if (covered >= need) return true;
+      if (slots === 0 || pos >= reachCount) return false;
+
+      const key = uncovered.toString(36) + ':' + slots + ':' + pos;
+      const cached = cache.get(key);
+      if (cached !== undefined) return cached;
+
+      // 打包上界：在剩余见证中取一组两两差异集不相交的见证（贪心极大族）。
+      // 一个被选单元至多命中其中一个，slots 个点至多覆盖其中 slots 个；
+      // 其余（族外）见证即使全部覆盖，覆盖数上界也是 total - packing + slots。
+      // 用位掩码计算邻域：某见证差异集的并集命中的全部见证都与它“相交”。
+      {
+        const minIndex = reachable[pos];
+        let rest = uncovered;
+        let packing = 0;
+        let unreachable = 0;
+        while (rest !== 0n) {
+          const j = firstUncovered(rest);
+          let neighborhood = 0n;
+          for (const i of alts[j].diff) {
+            if (i >= minIndex) neighborhood |= hitsOf(i);
+          }
+          if (neighborhood === 0n) {
+            // 后缀没有任何差异单元可覆盖它：它必然无法再被区分。
+            unreachable++;
+            rest &= ~(1n << BigInt(j));
+          } else {
+            packing++;
+            rest &= ~neighborhood;
+          }
+        }
+        const coverable = popCount(uncovered) - unreachable;
+        if (covered + (coverable - packing + slots) < need) {
+          cache.set(key, false);
+          return false;
+        }
+      }
+
+      const { upper, greedyCovered } = greedyBounds(uncovered, slots, pos);
+      if (covered + upper < need) {
+        cache.set(key, false);
+        return false;
+      }
+      if (covered + greedyCovered >= need) {
+        cache.set(key, true);
+        return true;
+      }
+
+      const candidates: { q: number; gain: bigint }[] = [];
+      for (let q = pos; q < reachCount; q++) {
+        const gain = hitsOf(reachable[q]) & uncovered;
+        if (gain !== 0n) candidates.push({ q, gain });
+      }
+      // 先尝试覆盖更多的单元：可行时尽快返回；不可行时仍完整搜索。
+      candidates.sort(
+        (a, b) =>
+          popCount(b.gain) - popCount(a.gain)
+          || a.q - b.q,
+      );
+
+      for (const { q, gain } of candidates) {
+        if (canReach(uncovered & ~gain, slots - 1, q + 1)) {
+          cache.set(key, true);
+          return true;
+        }
+      }
+      cache.set(key, false);
+      return false;
+    };
+
+    return canReach;
   };
-  maximize(0);
 
-  // 用行优先最小的可触达格补足到 MIN_PROBES（不改变覆盖数）
-  const filled = bestSelected.slice();
-  for (const idx of reachable) {
-    if (filled.length >= MIN_PROBES) break;
-    if (!filled.includes(idx)) filled.push(idx);
+  // 二分最大可覆盖数；判定是精确的，不能在搜索预算处提前停止而取近似值。
+  let low = 0;
+  let high = alts.length;
+  while (low < high) {
+    const mid = Math.floor((low + high + 1) / 2);
+    const canReach = makeCanReachTarget(mid);
+    if (canReach(fullMask, planK, 0)) low = mid;
+    else high = mid - 1;
   }
-  filled.sort((a, b) => a - b);
+  const canReachBest = makeCanReachTarget(low);
 
-  const selectedSet = new Set(filled);
-  let firstIdx = 0;
-  for (let j = 0; j < alts.length; j++) {
-    if (!alts[j].diff.some((i) => selectedSet.has(i))) {
-      firstIdx = j;
-      break;
+  // 逐位置取仍可达到最大覆盖数的最小坐标；无覆盖贡献的单元作为稳定填充点。
+  const selected: number[] = [];
+  let uncovered = fullMask;
+  let nextPos = 0;
+  while (selected.length < planK) {
+    const slotsAfter = planK - selected.length - 1;
+    let advanced = false;
+    for (let q = nextPos; q <= reachCount - 1 - slotsAfter; q++) {
+      const idx = reachable[q];
+      const nextUncovered = uncovered & ~hitsOf(idx);
+      if (canReachBest(nextUncovered, slotsAfter, q + 1)) {
+        selected.push(idx);
+        uncovered = nextUncovered;
+        nextPos = q + 1;
+        advanced = true;
+        break;
+      }
     }
+    if (!advanced) throw new Error('无法构造最大覆盖补测计划');
   }
+
+  const firstIdx = firstUncovered(uncovered);
   return {
     status: 'impossible',
     alternativeCount: alts.length,
-    points: makePoints(filled),
+    points: makePoints(selected),
     firstUndistinguished: toWitness(alts[firstIdx], cols),
   };
-}
-
-/** 等长坐标序列字典序比较：-1 / 0 / 1 */
-function lexSeq(a: number[], b: number[]): number {
-  for (let i = 0; i < Math.min(a.length, b.length); i++) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return a.length - b.length;
 }

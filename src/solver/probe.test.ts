@@ -115,6 +115,39 @@ describe('buildProbePlan', () => {
     expect(plan.firstUndistinguished.diffCells).toEqual([{ index: 10, row: 2, col: 2 }]);
   });
 
+  it('impossible 计划不得被初始贪心集合截断，必须取得最大覆盖数并稳定决胜', () => {
+    // 6×3、锚点在末格（17），共 21 个替代矩阵。0~7 各有两个独占见证；
+    // 单元 10、11 各覆盖两个只在该点不同的见证，单元 8 覆盖一个。
+    // 10 个名额取 0~7 后只剩两席：10+11 覆盖 4 个（共 20），
+    // 旧实现的初始截断 [0..8,11] 只覆盖 3 个（共 19），漏掉单元 10 的两个见证。
+    const N = 18;
+    const makeAlt = (value: number, ...diff: number[]) => {
+      const a = new Array(N).fill(0);
+      for (const i of diff) a[i] = value;
+      return a;
+    };
+    const alts = [
+      ...Array.from({ length: 8 }, (_, i) => makeAlt(1, i)),
+      ...Array.from({ length: 8 }, (_, i) => makeAlt(2, i)),
+      makeAlt(1, 8),
+      makeAlt(1, 10),
+      makeAlt(2, 10),
+      makeAlt(1, 11),
+      makeAlt(2, 11),
+    ].sort((a, b) => {
+      for (let i = 0; i < N; i++) if (a[i] !== b[i]) return a[i] - b[i];
+      return 0;
+    });
+
+    const plan = buildProbePlan(new Array(N).fill(0), alts, 17, 3);
+    expect(plan.status).toBe('impossible');
+    if (plan.status !== 'impossible') return;
+    expect(plan.alternativeCount).toBe(21);
+    expect(plan.points.map((p) => p.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 10, 11]);
+    expect(plan.firstUndistinguished.cycles).toEqual(makeAlt(1, 8));
+    expect(plan.firstUndistinguished.diffCells).toEqual([{ index: 8, row: 2, col: 2 }]);
+  });
+
   it('撞枚举预算时拒绝给出不可靠计划', () => {
     const alts: number[][] = [];
     for (let j = 0; j < 3; j++) {
@@ -130,6 +163,108 @@ describe('buildProbePlan', () => {
   it('测点数上限常量为 2..10', () => {
     expect(MIN_PROBES).toBe(2);
     expect(MAX_PROBES).toBe(10);
+  });
+
+  it('impossible 努力计划对拍暴力：最大覆盖、字典序决胜与首个未分辨见证', () => {
+    const mul = (seed: number) => {
+      let a = seed >>> 0;
+      return () => {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    };
+
+    for (let seed = 1; seed <= 300; seed++) {
+      const rand = mul(seed * 7 + 11);
+      const N = 12 + Math.floor(rand() * 5); // 12..16
+      const anchor = N - 1;
+      const reachable = Array.from({ length: N - 1 }, (_, i) => i);
+      const altCount = 10 + Math.floor(rand() * 20);
+      const alts: number[][] = [];
+      for (let j = 0; j < altCount; j++) {
+        const a = new Array(N).fill(0);
+        const size = 1 + Math.floor(rand() * 3);
+        for (let t = 0; t < size; t++) a[Math.floor(rand() * (N - 1))] = 1;
+        alts.push(a);
+      }
+      alts.sort((a, b) => {
+        for (let i = 0; i < N; i++) if (a[i] !== b[i]) return a[i] - b[i];
+        return 0;
+      });
+
+      const combos = (k: number): number[][] => {
+        const out: number[][] = [];
+        const cur: number[] = [];
+        const rec = (s: number) => {
+          if (cur.length === k) {
+            out.push(cur.slice());
+            return;
+          }
+          for (let i = s; i < reachable.length; i++) {
+            cur.push(reachable[i]);
+            rec(i + 1);
+            cur.pop();
+          }
+        };
+        rec(0);
+        return out;
+      };
+      const coveredBy = (sel: number[]) => {
+        const set = new Set(sel);
+        let n = 0;
+        for (const a of alts) {
+          if (a.some((v, i) => v !== 0 && set.has(i))) n++;
+        }
+        return n;
+      };
+
+      const K = Math.min(MAX_PROBES, reachable.length);
+      let expected:
+        | { status: 'ready'; sel: number[] }
+        | { status: 'impossible'; sel: number[]; first: number }
+        | null = null;
+      for (let k = MIN_PROBES; k <= K; k++) {
+        for (const c of combos(k)) {
+          if (coveredBy(c) === alts.length) {
+            expected = { status: 'ready', sel: c };
+            break;
+          }
+        }
+        if (expected) break;
+      }
+      if (!expected) {
+        let bestSel: number[] = [];
+        let bestCovered = -1;
+        for (const c of combos(K)) {
+          const n = coveredBy(c);
+          if (n > bestCovered) {
+            bestCovered = n;
+            bestSel = c;
+          }
+        }
+        const set = new Set(bestSel);
+        let first = 0;
+        for (let j = 0; j < alts.length; j++) {
+          if (!alts[j].some((v, i) => v !== 0 && set.has(i))) {
+            first = j;
+            break;
+          }
+        }
+        expected = { status: 'impossible', sel: bestSel, first };
+      }
+
+      const plan = buildProbePlan(new Array(N).fill(0), alts, anchor, 3);
+      expect(plan.status).toBe(expected.status);
+      if (plan.status === 'ready' || plan.status === 'impossible') {
+        expect(plan.points.map((p) => p.index)).toEqual(expected.sel);
+      }
+      if (plan.status === 'impossible' && expected.status === 'impossible') {
+        expect(plan.firstUndistinguished.cycles).toEqual(alts[expected.first]);
+      }
+    }
   });
 });
 
