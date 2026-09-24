@@ -115,6 +115,150 @@ describe('buildProbePlan', () => {
     expect(plan.firstUndistinguished.diffCells).toEqual([{ index: 10, row: 2, col: 2 }]);
   });
 
+  it('努力计划必须真正达到最大覆盖：舍独占点保双见证点（21 替代 / 需 11 点）', () => {
+    // 6×3、锚点在末格 17。21 个替代矩阵：
+    //   - 9 个独占见证：各自只在单元 0..8 上与主见证不同；
+    //   - 2 个见证只在单元 10 上不同（三值域：-1 与 +1）；
+    //   - 10 个见证都在单元 11 上不同（各自再在 {9,12..16} 上带不同组合以相互区分）。
+    // 完全区分需要 9 + 1 + 1 = 11 点；10 点的最大覆盖是 20：
+    // 放弃一个独占点，保留 10 与 11，字典序最小为 [0..7,10,11]。
+    const N = 18;
+    const cols = 3;
+    const anchor = 17;
+    const primary = new Array(N).fill(0);
+    const alts: number[][] = [];
+    for (const i of [0, 1, 2, 3, 4, 5, 6, 7, 8]) {
+      const a = new Array(N).fill(0);
+      a[i] = 1;
+      alts.push(a);
+    }
+    for (const v of [-1, 1]) {
+      const a = new Array(N).fill(0);
+      a[10] = v;
+      alts.push(a);
+    }
+    const comboCells = [9, 12, 13, 14, 15, 16];
+    for (let j = 1; j <= 10; j++) {
+      const a = new Array(N).fill(0);
+      a[11] = 1;
+      comboCells.forEach((cell, b) => {
+        if ((j >> b) & 1) a[cell] = 1;
+      });
+      alts.push(a);
+    }
+    alts.sort(lex);
+
+    const plan = buildProbePlan(primary, alts, anchor, cols);
+    expect(plan.status).toBe('impossible');
+    if (plan.status !== 'impossible') return;
+    expect(plan.alternativeCount).toBe(21);
+    const selected = plan.points.map((p) => p.index);
+    expect(selected).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 10, 11]);
+    // 覆盖 20/21：唯一未分辨的是独占单元 8 的见证
+    let covered = 0;
+    for (const a of alts) {
+      if (a.some((v, i) => v !== primary[i] && selected.includes(i))) covered++;
+    }
+    expect(covered).toBe(20);
+    const uncovered = alts.find(
+      (a) => !a.some((v, i) => v !== primary[i] && selected.includes(i)),
+    );
+    expect(plan.firstUndistinguished.cycles).toEqual(uncovered);
+    expect(plan.firstUndistinguished.diffCells).toEqual([{ index: 8, row: 2, col: 2 }]);
+  });
+
+  it('努力计划对拍暴力：覆盖数最大、并列字典序最小、见证与计划一致', () => {
+    const rand = mulberry32(20260924);
+    let checked = 0;
+    for (let trial = 0; trial < 400 && checked < 60; trial++) {
+      const N = 12 + Math.floor(rand() * 5); // 12..16 格
+      const cols = 3 + Math.floor(N / 6); // 仅影响行列换算
+      const anchor = N - 1 - Math.floor(rand() * 2);
+      const reachable: number[] = [];
+      for (let i = 0; i < N; i++) if (i !== anchor) reachable.push(i);
+
+      // 至少 11 个独占差异见证，保证 10 点不可能全部分辨
+      const privN = 11 + Math.floor(rand() * Math.min(4, reachable.length - 11));
+      const privCells = [...reachable].sort(() => rand() - 0.5).slice(0, privN);
+      const rawAlts: number[][] = privCells.map((cell) => {
+        const a = new Array(N).fill(0);
+        a[cell] = 1;
+        return a;
+      });
+      // 再混入若干共享/随机差异见证
+      const extraN = Math.floor(rand() * 6);
+      for (let e = 0; e < extraN; e++) {
+        const a = new Array(N).fill(0);
+        const sz = 1 + Math.floor(rand() * 3);
+        for (let s = 0; s < sz; s++) a[reachable[Math.floor(rand() * reachable.length)]] = 1;
+        if (a.some((v) => v !== 0) && !rawAlts.some((x) => x.every((v, i) => v === a[i]))) {
+          rawAlts.push(a);
+        }
+      }
+      rawAlts.sort(lex);
+
+      const plan = buildProbePlan(new Array(N).fill(0), rawAlts, anchor, cols);
+      if (plan.status !== 'impossible') continue;
+      checked++;
+
+      // 独立暴力：枚举全部 10 元可触达子集，取覆盖最多且字典序最小者
+      const diffs = rawAlts.map((a) => {
+        const s = new Set<number>();
+        a.forEach((v, i) => {
+          if (v !== 0) s.add(i);
+        });
+        return s;
+      });
+      let bestCover = -1;
+      let bestCombo: number[] | null = null;
+      const cur: number[] = [];
+      const combos = (s: number) => {
+        if (cur.length === 10) {
+          const sel = new Set(cur);
+          const c = diffs.filter((d) => [...d].some((i) => sel.has(i))).length;
+          if (c > bestCover || (c === bestCover && lex(cur, bestCombo as number[]) < 0)) {
+            bestCover = c;
+            bestCombo = cur.slice();
+          }
+          return;
+        }
+        for (let i = s; i < reachable.length; i++) {
+          cur.push(reachable[i]);
+          combos(i + 1);
+          cur.pop();
+        }
+      };
+      combos(0);
+      const brute = bestCombo!;
+
+      expect(plan.points.map((p) => p.index)).toEqual(brute);
+      const sel = new Set(brute);
+      const firstJ = diffs.findIndex((d) => ![...d].some((i) => sel.has(i)));
+      expect(plan.firstUndistinguished.cycles).toEqual(rawAlts[firstJ]);
+    }
+    expect(checked).toBeGreaterThan(30);
+  });
+
+  it('大量互不相干独占见证下努力计划仍精确且快速', () => {
+    // 95 个独占见证（24×4 规模、95 个可触达单元）→ 需 95 点，10 点只能覆盖 10 个
+    const N = 96;
+    const anchor = 95;
+    const alts: number[][] = [];
+    for (let j = 0; j < 95; j++) {
+      const a = new Array(N).fill(0);
+      a[j] = 1;
+      alts.push(a);
+    }
+    const t0 = Date.now();
+    const plan = buildProbePlan(new Array(N).fill(0), alts, anchor, 4);
+    const ms = Date.now() - t0;
+    expect(plan.status).toBe('impossible');
+    if (plan.status !== 'impossible') return;
+    expect(plan.points.map((p) => p.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(plan.firstUndistinguished.diffCells).toEqual([{ index: 10, row: 2, col: 2 }]);
+    expect(ms).toBeLessThan(1000);
+  });
+
   it('撞枚举预算时拒绝给出不可靠计划', () => {
     const alts: number[][] = [];
     for (let j = 0; j < 3; j++) {

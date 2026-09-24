@@ -8,17 +8,16 @@
  *     （即补测集击中每个替代矩阵的差异单元集合）；
  *   - 依次选择测点数最少、行优先坐标序列字典序最小的计划。
  *
- * 若允许的测点数上限内仍不能区分全部替代矩阵，则给出在同样偏好下
- * （测点最少、字典序最小）覆盖替代矩阵数最多的计划，以及首个未被
- * 区分的圈数矩阵与其差异单元。
+ * 若允许的测点数上限内仍不能区分全部替代矩阵，则给出**精确的最大覆盖**
+ * 努力计划（完整比较全部至多 10 点的差异点组合，非启发式近似），以及首个
+ * 未被区分的圈数矩阵与其差异单元；覆盖数相同时同样取行优先坐标序列字典序
+ * 最小者，保证首个未分辨见证与所展示计划一致。
  */
 
 export const MIN_PROBES = 2;
 export const MAX_PROBES = 10;
 /** 替代矩阵枚举撞上预算时，规划不再可靠（见 solver 中同名预算） */
 export const DEFAULT_ALTERNATIVE_BUDGET = 200;
-/** 最佳努力搜索的节点预算，超过后取当时最优（确定性行为） */
-const SEARCH_NODE_BUDGET = 500_000;
 
 export interface ProbeWitness {
   /** 替代见证的完整行优先圈数序列 */
@@ -126,11 +125,6 @@ export function buildProbePlan(
 
   /** 未被选中点击中的替代矩阵位掩码（替代矩阵数 ≤ 枚举预算，用 bigint 稳妥） */
   const fullMask = (1n << BigInt(alts.length)) - 1n;
-  const uncoveredOf = (chosen: Set<number>): bigint => {
-    let m = fullMask;
-    for (const i of chosen) m &= ~hitsOf(i);
-    return m;
-  };
   const firstUncovered = (mask: bigint): number => {
     if (mask === 0n) return -1;
     for (let j = 0; j < alts.length; j++) if (mask & (1n << BigInt(j))) return j;
@@ -264,60 +258,152 @@ export function buildProbePlan(
 
   /* ---- 上限内无法全部分辨：求覆盖替代矩阵数最多的努力计划 ---- */
 
-  // 目标测点数：尽量凑满 MAX_PROBES（差异点不足时用最小可触达格填充）
+  // 固定比较口径：从全部差异单元中选 coreK 个（差异点不足 MIN_PROBES 时再用
+  // 最小可触达格填充）。多出的差异点不会降低覆盖数，故“至多 10 点”下的最大
+  // 覆盖数必在 coreK = min(MAX_PROBES, 差异点数) 个差异点处取得。
   const coreK = Math.min(MAX_PROBES, varying.length);
-  let bestSelected: number[] = varying.slice(0, coreK);
-  let bestCovered = -1;
-  let nodes = 0;
 
-  const coverageOf = (sel: Set<number>): number => {
+  const bitCount = (x: bigint): number => {
     let n = 0;
-    for (const a of alts) if (a.diff.some((i) => sel.has(i))) n++;
+    while (x) {
+      x &= x - 1n;
+      n++;
+    }
     return n;
   };
 
+  // suf[t]：varying[t..] 全部差异点击中替代矩阵的并集（后缀覆盖上界用）
+  const suf: bigint[] = new Array(varying.length + 1);
+  suf[varying.length] = 0n;
+  for (let t = varying.length - 1; t >= 0; t--) {
+    suf[t] = suf[t + 1] | hitsOf(varying[t]);
+  }
+
+  /**
+   * 从 (已覆盖 mask, 候选起点 t) 出发，在恰好 rem 个名额内贪心补全：
+   * 每轮在“尚未选中、下标 ≥ 起选位”的差异点中取新增覆盖最多者（并列取
+   * 行优先最小）；新增均为 0（所有后缀点都无增益）时，仍按行优先最小的
+   * 剩余差异点凑满 rem 个。coreK ≤ varying.length 保证总能凑满。
+   * 返回的下标数组与已选前缀拼接后是一条合法的 coreK 点计划。
+   */
+  const greedyComplete = (mask: bigint, t: number, rem: number): number[] => {
+    const picked: number[] = [];
+    const used = new Set<number>();
+    let m = mask;
+    while (picked.length < rem) {
+      let bestQ = -1;
+      let bestGain = -1;
+      for (let q = t; q < varying.length; q++) {
+        if (used.has(q)) continue;
+        const gain = bitCount(hitsOf(varying[q]) & ~m);
+        if (gain > bestGain || (gain === bestGain && (bestQ < 0 || varying[q] < varying[bestQ]))) {
+          bestGain = gain;
+          bestQ = q;
+        }
+      }
+      // rem ≤ varying.length - t（调用处保证候选点充足），bestQ 必有效
+      picked.push(varying[bestQ]);
+      used.add(bestQ);
+      m |= hitsOf(varying[bestQ]);
+    }
+    // 贪心按增益选取，下标未必递增；作为计划与字典序候选需升序
+    return picked.sort((a, b) => a - b);
+  };
+
+  // 初始可行解：根节点贪心，确定有效下界
+  let bestMask: bigint = 0n;
+  let bestCore: number[] = [];
+  {
+    bestCore = greedyComplete(0n, 0, coreK);
+    for (const v of bestCore) bestMask |= hitsOf(v);
+  }
+  let bestCovered = bitCount(bestMask);
+
+  /**
+   * 精确分支限界：按行优先升序枚举 varying 中全部 coreK 元子集，允许选入
+   * “当下无新增覆盖”的点——固定测点数下它可能是字典序决胜的一部分。
+   *
+   * 节点处两条绝不高估的乐观上界：
+   *   U1 = 已覆盖 + 后缀候选点能新击中的未覆盖替代矩阵并集大小；
+   *   U2 = 已覆盖 + 剩余名额 × 单点最大新增（后续每点边际增益不增）。
+   * 上界严格小于当前最优才剪枝；持平（U == bestCovered）时还要证明后缀在
+   * 字典序上也不可能胜过当前最优计划，才允许剪枝（见 lexBestSuffix）。
+   */
   const chosen: number[] = [];
-  const inChosen = new Set<number>();
-  const maximize = (start: number): void => {
-    const covered = coverageOf(inChosen);
-    const remaining = coreK - chosen.length;
-    const uncoveredCount = alts.length - covered;
-    // 乐观上界：剩余名额每点最多新覆盖一个“当前未覆盖”的替代矩阵组
-    if (covered + Math.min(remaining, uncoveredCount) < bestCovered) return;
-    if (chosen.length === coreK) {
-      // 仅在满深度（coreK 个差异点）叶子上比较，避免短序列误入
-      if (
-        covered > bestCovered ||
-        (covered === bestCovered && lexSeq(chosen, bestSelected) < 0)
-      ) {
+  const seenStates = new Set<string>();
+
+  /**
+   * 上界与当前最优持平时，后缀无法再增加覆盖，只能靠字典序更小胜出。
+   * 后缀（varying 下标 ≥ t、需选 rem 个）的行优先最小补全就是最小的 rem 个
+   * 候选差异点；把它拼到当前已选前缀后，若仍不严格小于当前最优计划，
+   * 则该节点的任何补全都不可能更优，可安全剪枝。
+   */
+  const lexSuffixCouldImprove = (t: number, rem: number): boolean => {
+    const seq = chosen.slice();
+    for (let q = t; q < varying.length && seq.length - chosen.length < rem; q++) {
+      seq.push(varying[q]);
+    }
+    return lexSeq(seq, bestCore) < 0;
+  };
+
+  const maximize = (t: number, mask: bigint): void => {
+    const d = chosen.length;
+    if (d === coreK) {
+      const covered = bitCount(mask);
+      if (covered > bestCovered || (covered === bestCovered && lexSeq(chosen, bestCore) < 0)) {
         bestCovered = covered;
-        bestSelected = chosen.slice();
+        bestMask = mask;
+        bestCore = chosen.slice();
       }
       return;
     }
-    if (++nodes > SEARCH_NODE_BUDGET) return; // 预算耗尽：停止扩展，保留已找到的满深度最优
-    // 候选：击中任一未覆盖集合且下标 ≥ start 的全部单元（升序），
-    // 保证按字典序完整搜索，而非只沿首个未覆盖集的差异点贪心。
-    let candBits = 0n;
-    for (let t = 0; t < alts.length; t++) {
-      if (uncoveredOf(inChosen) & (1n << BigInt(t))) {
-        for (const i of alts[t].diff) if (i >= start) candBits |= 1n << BigInt(i);
+    const rem = coreK - d;
+    if (varying.length - t < rem) return; // 剩余差异点不足名额
+
+    // 同形子问题：同 (t, 覆盖, 已选数) 下后缀抉择完全一致；DFS 升序先到的
+    // 前缀字典序更小，重复状态的任何补全都不会更优。
+    const stateKey = t + '|' + mask.toString(36) + '|' + d;
+    if (seenStates.has(stateKey)) return;
+    seenStates.add(stateKey);
+
+    const covered = bitCount(mask);
+    const possible = (~mask) & suf[t] & fullMask;
+    const possibleN = bitCount(possible);
+    const upper1 = covered + possibleN;
+    // U2：剩余每点至多新增当前最大边际
+    let maxMarginal = 0;
+    for (let q = t; q < varying.length; q++) {
+      const gain = bitCount(hitsOf(varying[q]) & ~mask);
+      if (gain > maxMarginal) maxMarginal = gain;
+    }
+    const upper = Math.min(upper1, covered + rem * maxMarginal);
+    if (upper < bestCovered) return;
+    if (upper === bestCovered && !lexSuffixCouldImprove(t, rem)) return;
+
+    // 浅层节点用贪心可行解刷新下界（费用小、剪枝强）
+    if (d <= 4) {
+      const tail = greedyComplete(mask, t, rem);
+      let gm = mask;
+      for (const v of tail) gm |= hitsOf(v);
+      const gc = bitCount(gm);
+      const seq = [...chosen, ...tail];
+      if (gc > bestCovered || (gc === bestCovered && lexSeq(seq, bestCore) < 0)) {
+        bestCovered = gc;
+        bestMask = gm;
+        bestCore = seq;
       }
     }
-    for (let idx = start; idx < N; idx++) {
-      if (!(candBits & (1n << BigInt(idx)))) continue;
-      chosen.push(idx);
-      inChosen.add(idx);
-      maximize(idx + 1);
-      inChosen.delete(idx);
+
+    for (let q = t; q + rem <= varying.length; q++) {
+      chosen.push(varying[q]);
+      maximize(q + 1, mask | hitsOf(varying[q]));
       chosen.pop();
-      if (nodes > SEARCH_NODE_BUDGET) break;
     }
   };
-  maximize(0);
+  maximize(0, 0n);
 
   // 用行优先最小的可触达格补足到 MIN_PROBES（不改变覆盖数）
-  const filled = bestSelected.slice();
+  const filled = bestCore.slice();
   for (const idx of reachable) {
     if (filled.length >= MIN_PROBES) break;
     if (!filled.includes(idx)) filled.push(idx);
@@ -325,7 +411,7 @@ export function buildProbePlan(
   filled.sort((a, b) => a - b);
 
   const selectedSet = new Set(filled);
-  let firstIdx = 0;
+  let firstIdx = -1;
   for (let j = 0; j < alts.length; j++) {
     if (!alts[j].diff.some((i) => selectedSet.has(i))) {
       firstIdx = j;
